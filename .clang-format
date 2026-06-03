@@ -19,6 +19,7 @@ KeepEmptyLinesAtTheStartOfBlocks: true
 
 # Comments: try not to touch them much
 ReflowComments: false
+FixNamespaceComments: false
 ColumnLimit: 0
 
 # Align * and & with the type

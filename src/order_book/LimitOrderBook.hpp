@@ -27,6 +27,34 @@ class LimitOrderBook : public OrderBook<LimitOrderBook>
     LimitOrderBook(LimitOrderBook&& other) noexcept;
     LimitOrderBook& operator=(LimitOrderBook&& other) noexcept;
 
+    template <class F>
+    void for_each_level(Side side, F&& fn) const
+    {
+        if (side == Side::Buy)
+            for (const PriceLevel* lv = best_bid_; lv; lv = inorder_predecessor(lv))
+                fn(lv->price, static_cast<std::int64_t>(lv->total_quantity));
+        else if (side == Side::Sell)
+            for (const PriceLevel* lv = best_ask_; lv; lv = inorder_successor(lv))
+                fn(lv->price, static_cast<std::int64_t>(lv->total_quantity));
+    }
+
+    template <class F>
+    void for_levels_until(Side side, F&& fn) const
+    {
+        if (side == Side::Buy)
+        {
+            for (const PriceLevel* lv = best_bid_; lv; lv = inorder_predecessor(lv))
+                if (!fn(lv->price, static_cast<std::int64_t>(lv->total_quantity)))
+                    return;
+        }
+        else if (side == Side::Sell)
+        {
+            for (const PriceLevel* lv = best_ask_; lv; lv = inorder_successor(lv))
+                if (!fn(lv->price, static_cast<std::int64_t>(lv->total_quantity)))
+                    return;
+        }
+    }
+
   protected:
     void apply_impl(const MarketDataEvent& event);
 

@@ -6,12 +6,14 @@
 #include "ingestion/FlatMerger.hpp"
 #include "ingestion/IngestionPipeline.hpp"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <deque>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -19,6 +21,9 @@
 #include "order_book/AbseilOrderBook.hpp"
 #include "order_book/BookAnomalyLog.hpp"
 #include "order_book/SimpleOrderBookRouter.hpp"
+#include "simulation/Position.hpp"
+#include "simulation/SimulationHarness.hpp"
+#include "simulation/Strategy.hpp"
 
 #define PROCESS_MARKET_DATA_EVENT_MODE 1 // 1 = COUNT mode, 2 = PRINT mode
 
@@ -114,76 +119,128 @@ struct ProcessMarketDataEvent
     cmf::SimpleOrderBookRouter<cmf::AbseilOrderBook> order_book_router_;
 };
 
+template <class Sink>
+double run_pipeline(const Config& cfg, Sink& sink)
+{
+    using parser_impl = cmf::FeatherDataParser;
+    const std::size_t data_files_count = cfg.data_files.size();
+
+    NaiveTimer timer;
+    std::deque<BlockingQueue<MarketDataEvent>> file_queues;
+    for (std::size_t i = 0; i < data_files_count; ++i)
+        file_queues.emplace_back();
+
+    BlockingQueue<MarketDataEvent> merged_queue;
+    const FlatMerger<BlockingQueue, BlockingQueue> merger(file_queues, merged_queue);
+
+    std::thread merger_thread([&]()
+                              { merger.run_impl(); });
+    std::thread dispatcher_thread([&]()
+                                  { while (merged_queue.pop([&](MarketDataEvent &&e) { sink(e); })); });
+
+    std::vector<std::thread> producers;
+    producers.reserve(data_files_count);
+    for (std::size_t i = 0; i < data_files_count; ++i)
+    {
+        producers.emplace_back([&file_queues, &cfg, i]()
+                               {
+      BatchPusher batcher{file_queues[i]};
+      auto push_fn = [&batcher](const MarketDataEvent &e) { batcher.push(e); };
+      IngestionPipeline<parser_impl, decltype(push_fn)> pipeline(
+          cfg.data_files[i], push_fn);
+      pipeline.ingest();
+      file_queues[i].close(); });
+    }
+
+    for (auto& t : producers)
+        t.join();
+    merger_thread.join();
+    dispatcher_thread.join();
+    return timer.elapsed_seconds();
+}
+
+static int run_default(const Config& cfg)
+{
+    ProcessMarketDataEvent sink;
+    std::thread io_thread([&sink]()
+                          {
+    while (sink.print_queue.pop(
+        [](std::string &&msg) { std::fputs(msg.c_str(), stdout); })) {
+    } });
+
+    const double elapsed = run_pipeline(cfg, sink);
+
+#if PROCESS_MARKET_DATA_EVENT_MODE == 1
+    sink.summary(elapsed);
+#endif
+    sink.print_best_bid_ask(std::cout);
+    BookAnomalyLog::instance().write_summary(std::cerr);
+    BookAnomalyLog::instance().flush();
+    sink.print_queue.close();
+    io_thread.join();
+    return 0;
+}
+
+static int run_simulation(const Config& cfg)
+{
+    constexpr std::size_t kEngines = 4;
+    constexpr ScaledPrice kWideLimit = 1'000'000'000'000'000;
+    std::vector<sim::NaiveTaker> strategies(kEngines, sim::NaiveTaker{kWideLimit, 1});
+    const sim::FeeSchedule fees{2.0, -1.0};
+
+    sim::SimulationHarness<sim::NaiveTaker> harness(std::vector<std::uint32_t>{}, strategies,
+                                                    65536, fees);
+    const double elapsed = run_pipeline(cfg, harness);
+    harness.flush();
+
+    std::vector<std::uint32_t> instruments = harness.instruments();
+    std::sort(instruments.begin(), instruments.end());
+
+    std::printf("Wall-clock time : %.3f s\n", elapsed);
+    std::printf("instruments     : %zu\n", instruments.size());
+    std::printf("engines         : %zu\n", harness.engine_count());
+    std::printf("synthetic fills : %" PRIu64 "\n", harness.total_fills());
+    std::printf("total net pnl   : %.6f\n", harness.total_net_pnl());
+    for (std::size_t e = 0; e < harness.engine_count(); ++e)
+        std::printf("  engine %zu net pnl=%.6f\n", e, harness.engine_net_pnl(e));
+
+    for (std::size_t j = 0; j < instruments.size() && j < 10; ++j)
+    {
+        const std::uint32_t instr = instruments[j];
+        if (const auto* b = harness.router().find_basement(instr))
+        {
+            const auto bid = b->best_price(Side::Buy);
+            const auto ask = b->best_price(Side::Sell);
+            std::printf("  instrument %u best_bid=%lld best_ask=%lld\n", instr,
+                        static_cast<long long>(bid ? *bid : 0),
+                        static_cast<long long>(ask ? *ask : 0));
+        }
+    }
+    return 0;
+}
+
 int main([[maybe_unused]] int argc, [[maybe_unused]] const char* argv[])
 {
     try
     {
-        using parser_impl = cmf::FeatherDataParser;
-        const Config cfg =
-            parse_args(std::span(argv, argc), parser_impl::filename_ext);
-        const std::size_t data_files_count = cfg.data_files.size();
-
-        // Open predefined anomaly log files (logs/order-book-anomalies.log, etc.).
-        [[maybe_unused]] auto& anomaly_log = BookAnomalyLog::instance();
-
-        NaiveTimer timer;
-        std::deque<BlockingQueue<MarketDataEvent>> file_queues;
-        for (std::size_t i = 0; i < data_files_count; ++i)
-            file_queues.emplace_back();
-
-        BlockingQueue<MarketDataEvent> merged_queue;
-        const FlatMerger<BlockingQueue, BlockingQueue> merger(file_queues,
-                                                              merged_queue);
-
-        ProcessMarketDataEvent sink;
-        std::thread io_thread([&sink]()
-                              {
-      while (sink.print_queue.pop(
-          [](std::string &&msg) { std::fputs(msg.c_str(), stdout); })) {
-      } });
-        std::thread merger_thread([&]()
-                                  { merger.run_impl(); });
-        std::thread dispatcher_thread([&]()
-                                      {
-      while (merged_queue.pop([&](MarketDataEvent &&e) { sink(e); }))
-        ;
-
-#if PROCESS_MARKET_DATA_EVENT_MODE == 1
-      sink.summary(timer.elapsed_seconds());
-#endif
-
-      sink.print_best_bid_ask(std::cout);
-      BookAnomalyLog::instance().write_summary(std::cerr);
-      BookAnomalyLog::instance().flush();
-      sink.print_queue.close(); });
-
-        std::vector<std::thread> producers;
-        producers.reserve(data_files_count);
-        for (std::size_t i = 0; i < data_files_count; ++i)
+        std::vector<const char*> args(argv, argv + argc);
+        bool simulate = false;
+        if (args.size() >= 2 && std::string_view(args[1]) == "--simulate")
         {
-            producers.emplace_back([&file_queues, &cfg, i]()
-                                   {
-        BatchPusher batcher{file_queues[i]};
-        auto push_fn = [&batcher](const MarketDataEvent &e) {
-          batcher.push(e);
-        };
-        IngestionPipeline<parser_impl, decltype(push_fn)> pipeline(
-            cfg.data_files[i], push_fn);
-        pipeline.ingest();
-        file_queues[i].close(); });
+            simulate = true;
+            args.erase(args.begin() + 1);
         }
 
-        for (auto& t : producers)
-            t.join();
-        merger_thread.join();
-        dispatcher_thread.join();
-        io_thread.join();
+        const Config cfg = parse_args(std::span<const char*>(args.data(), args.size()),
+                                      cmf::FeatherDataParser::filename_ext);
+
+        [[maybe_unused]] auto& anomaly_log = BookAnomalyLog::instance();
+
+        return simulate ? run_simulation(cfg) : run_default(cfg);
     }
     catch (std::exception& ex)
     {
         std::cerr << "Back-tester threw an exception: " << ex.what() << std::endl;
         return 1;
     }
-
-    return 0;
 }

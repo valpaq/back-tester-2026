@@ -5,7 +5,8 @@ cmf::Config cmf::parse_args(const std::span<const char*> args,
 {
     auto print_usage_hint = [&]()
     {
-        std::fprintf(stderr, "Usage: %s <file.mbo.json | folder>\n", args[0]);
+        std::fprintf(stderr, "Usage: %s [--simulate] <file.mbo.json | folder>\n",
+                     args[0]);
     };
 
     if (args.size() != 2)

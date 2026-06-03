@@ -27,3 +27,5 @@ target_link_libraries(${TARGET} PRIVATE
 )
 
 catch_discover_tests(${TARGET})
+
+add_subdirectory(simulation)
